@@ -30,7 +30,7 @@ Through this process, the robot gradually learns the maze and eventually finds t
 
 This approach ensures accurate navigation, adaptability to unknown mazes, and optimal pathfinding using embedded system logic.
 
-<img width="860" height="900" alt="image" src="https://github.com/user-attachments/assets/c952a2d3-2139-48ac-925c-c6fd65afceec" />
+<img width="660" height="900" alt="image" src="https://github.com/user-attachments/assets/c952a2d3-2139-48ac-925c-c6fd65afceec" />
 
 
  
