@@ -32,6 +32,8 @@ This approach ensures accurate navigation, adaptability to unknown mazes, and op
 
 <img width="660" height="900" alt="image" src="https://github.com/user-attachments/assets/c952a2d3-2139-48ac-925c-c6fd65afceec" />
 
+
+
 DEMO VIDEO
 
 https://drive.google.com/file/d/1kBhiW2tCx15ScLxTzwNshnd4mURk8ys3/view?usp=drivesdk
