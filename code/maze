@@ -1,0 +1,411 @@
+
+// 16x16 maze, goal = 4 center cells (7,7),(7,8),(8,7),(8,8)
+// 3 IR sensors: front, left, right (active LOW = wall)
+// 2 DC motors via L298N with PWM on ENA/ENB (slower while turning)
+// Motion is time-based (delay) instead of encoder counts
+
+// ---------- MOTOR & PWM PINS ----------
+#define M1_IN1 14    // left motor IN1
+#define M1_IN2 27    // left motor IN2
+#define ENA    19    // L298N ENA (PWM from ESP32)
+
+#define M2_IN3 26    // right motor IN3
+#define M2_IN4 4     // right motor IN4
+#define ENB    21    // L298N ENB (PWM from ESP32)
+
+// ---------- IR SENSORS (active LOW = wall) ----------
+#define IR_FRONT_PIN 33
+#define IR_LEFT_PIN  32
+#define IR_RIGHT_PIN 34
+
+// ---------- MAZE CONSTANTS ----------
+#define MAZE_SIZE 16
+
+// Movement timing (YOU MUST TUNE THESE)
+const int CELL_TIME_MS = 500;  // time to move one cell straight
+const int TURN_TIME_MS = 500;  // time to rotate ~90° at slow speed
+
+// PWM (ESP32 core 3.x LEDC API)
+const int freq       = 20000;  // 20 kHz
+const int resolution = 8;      // 0–255 duty
+const int chA        = 0;
+const int chB        = 1;
+
+// ---------- GLOBAL STATE ----------
+uint8_t walls[MAZE_SIZE][MAZE_SIZE];    // wall bits: 1=N,2=E,4=S,8=W
+uint8_t distMap[MAZE_SIZE][MAZE_SIZE];  // flood-fill distances
+
+int curRow = 0, curCol = 0;   // starting cell (0,0)
+int heading = 0;              // 0=N,1=E,2=S,3=W
+
+// ================= GOAL & INIT =================
+bool isGoal(int r, int c) {
+  // center 4 cells of 16x16 maze
+  return (r == 7 || r == 8) && (c == 7 || c == 8);
+}
+
+void initMaze() {
+  for (int r = 0; r < MAZE_SIZE; r++) {
+    for (int c = 0; c < MAZE_SIZE; c++) {
+      walls[r][c] = 0;
+      if (r == 0)             walls[r][c] |= 1; // N border
+      if (r == MAZE_SIZE-1)   walls[r][c] |= 4; // S border
+      if (c == 0)             walls[r][c] |= 8; // W border
+      if (c == MAZE_SIZE-1)   walls[r][c] |= 2; // E border
+    }
+  }
+}
+
+void initDistMap() {
+  for (int r = 0; r < MAZE_SIZE; r++) {
+    for (int c = 0; c < MAZE_SIZE; c++) {
+      int dr = min(abs(r - 7), abs(r - 8));
+      int dc = min(abs(c - 7), abs(c - 8));
+      distMap[r][c] = dr + dc;   // Manhattan to center
+    }
+  }
+}
+
+// ================= MOTOR HELPERS (PWM) =================
+void setSpeed(uint8_t duty) {
+  ledcWrite(ENA, duty);
+  ledcWrite(ENB, duty);
+}
+
+void motorsForward() {
+  digitalWrite(M1_IN1, HIGH);
+  digitalWrite(M1_IN2, LOW);
+  digitalWrite(M2_IN3, HIGH);
+  digitalWrite(M2_IN4, LOW);
+}
+
+void motorsBackward() {
+  digitalWrite(M1_IN1, LOW);
+  digitalWrite(M1_IN2, HIGH);
+  digitalWrite(M2_IN3, LOW);
+  digitalWrite(M2_IN4, HIGH);
+}
+
+void motorsTurnLeft() {   // CCW: left back, right forward
+  digitalWrite(M1_IN1, LOW);
+  digitalWrite(M1_IN2, HIGH);
+  digitalWrite(M2_IN3, HIGH);
+  digitalWrite(M2_IN4, LOW);
+}
+
+void motorsTurnRight() {  // CW: left forward, right back
+  digitalWrite(M1_IN1, HIGH);
+  digitalWrite(M1_IN2, LOW);
+  digitalWrite(M2_IN3, LOW);
+  digitalWrite(M2_IN4, HIGH);
+}
+
+void stopMotors() {
+  setSpeed(0);
+  digitalWrite(M1_IN1, LOW);
+  digitalWrite(M1_IN2, LOW);
+  digitalWrite(M2_IN3, LOW);
+  digitalWrite(M2_IN4, LOW);
+}
+
+// ================= IR =================
+bool wallFront() { return digitalRead(IR_FRONT_PIN) == LOW; }
+bool wallLeft()  { return digitalRead(IR_LEFT_PIN)  == LOW; }
+bool wallRight() { return digitalRead(IR_RIGHT_PIN) == LOW; }  // active-low IR[web:149]
+
+// ================= MOVEMENT (TIME + IR CHECK) =================
+void moveOneCell() {
+  // --- try to go straight until wall or end of cell ---
+  motorsForward();
+  setSpeed(195);   // straight speed
+
+  unsigned long start = millis();
+  bool hitFront = false;
+
+  while (millis() - start < CELL_TIME_MS) {
+    // front wall check
+    if (wallFront()) {
+      hitFront = true;
+      break;
+    }
+
+    // ---------- SIDE WALL SMALL CORRECTION ----------
+    if (wallLeft() && !wallRight()) {
+      // left IR sees wall -> nudge robot slightly to the RIGHT
+      motorsTurnRight();       // in-place right
+      setSpeed(175);
+      delay(25);               // ~small correction
+      motorsForward();         // go straight again
+      setSpeed(195);
+    } else if (wallRight() && !wallLeft()) {
+      // right IR sees wall -> nudge robot slightly to the LEFT
+      motorsTurnLeft();        // in-place left
+      setSpeed(175);
+      delay(25);               // ~small correction
+      motorsForward();         // go straight again
+      setSpeed(195);
+    }
+
+    delay(5);
+  }
+
+  stopMotors();
+
+  if (!hitFront) {
+    // normal case: we finished the cell
+    if (heading == 0)      curRow--;
+    else if (heading == 1) curCol++;
+    else if (heading == 2) curRow++;
+    else if (heading == 3) curCol--;
+    return;
+  }
+
+  // ---------- FRONT WALL ESCAPE LOGIC ----------
+
+  // 0) creep ~50 ms closer after first detection (overshoot to fixed distance)
+  motorsForward();
+  setSpeed(195);
+  delay(50);        // tune this 50 ms
+  stopMotors();
+
+  // 1) small pause
+  delay(100);
+
+  // 2) try up to 4 directions (4 * 90° = full circle),
+  // always checking front after each 90° turn.
+  bool foundOpenDir = false;
+  for (int i = 0; i < 4; i++) {
+    if (!wallFront()) {
+      foundOpenDir = true;
+      break;
+    }
+    // rotate right 90°, heading is updated inside turnRight90()
+    turnRight90();
+  }
+
+  if (!foundOpenDir) {
+    // all 4 directions blocked; let higher-level dead-end logic handle it
+    return;
+  }
+
+  // We have a free direction in front -> move one cell forward in this direction
+  motorsForward();
+  setSpeed(195);
+  delay(CELL_TIME_MS);
+  stopMotors();
+
+  // update position after this extra forward cell
+  if (heading == 0)      curRow--;
+  else if (heading == 1) curCol++;
+  else if (heading == 2) curRow++;
+  else if (heading == 3) curCol--;
+}
+
+// ================= TURNS =================
+void turnLeft90() {
+  motorsTurnLeft();
+  setSpeed(185);                 // slower turning speed
+  delay(400);                    // tuned ~90°
+  stopMotors();
+  heading = (heading + 3) & 3;
+  delay(200);
+}
+
+void turnRight90() {
+  motorsTurnRight();
+  setSpeed(180);                 // slower turning speed
+  delay(TURN_TIME_MS);
+  stopMotors();
+  heading = (heading + 1) & 3;
+  delay(200);
+}
+
+void turn180() {
+  turnLeft90();
+  delay(250);
+  turnLeft90();
+  delay(250);
+}
+
+// ================= WALL MAPPING =================
+void mirrorWalls(int r, int c) {
+  uint8_t w = walls[r][c];
+  if (w & 1 && r > 0)               walls[r-1][c] |= 4;
+  if (w & 4 && r < MAZE_SIZE-1)     walls[r+1][c] |= 1;
+  if (w & 2 && c < MAZE_SIZE-1)     walls[r][c+1] |= 8;
+  if (w & 8 && c > 0)               walls[r][c-1] |= 2;
+}
+
+void updateWallsHere() {
+  bool f = wallFront();
+  bool l = wallLeft();
+  bool r = wallRight();
+
+  if (f) {
+    int bit = (heading==0)?1:(heading==1)?2:(heading==2)?4:8;
+    walls[curRow][curCol] |= bit;
+  }
+  if (l) {
+    int dir = (heading + 3) & 3;
+    int bit = (dir==0)?1:(dir==1)?2:(dir==2)?4:8;
+    walls[curRow][curCol] |= bit;
+  }
+  if (r) {
+    int dir = (heading + 1) & 3;
+    int bit = (dir==0)?1:(dir==1)?2:(dir==2)?4:8;
+    walls[curRow][curCol] |= bit;
+  }
+  mirrorWalls(curRow, curCol);
+}
+
+// ================= FLOOD-FILL =================
+void recomputeFloodFill() {
+  bool changed;
+  do {
+    changed = false;
+    for (int r = 0; r < MAZE_SIZE; r++) {
+      for (int c = 0; c < MAZE_SIZE; c++) {
+        if (isGoal(r, c)) {
+          if (distMap[r][c] != 0) {
+            distMap[r][c] = 0;
+            changed = true;
+          }
+          continue;
+        }
+
+        uint8_t w  = walls[r][c];
+        uint8_t mn = 255;
+
+        if (!(w & 1) && r > 0)               mn = min(mn, distMap[r-1][c]);   // N
+        if (!(w & 2) && c < MAZE_SIZE-1)     mn = min(mn, distMap[r][c+1]);   // E
+        if (!(w & 4) && r < MAZE_SIZE-1)     mn = min(mn, distMap[r+1][c]);   // S
+        if (!(w & 8) && c > 0)               mn = min(mn, distMap[r][c-1]);   // W
+
+        uint8_t nv = (mn == 255) ? 255 : (mn + 1);
+        if (nv != distMap[r][c]) {
+          distMap[r][c] = nv;
+          changed = true;
+        }
+      }
+    }
+  } while (changed);
+}
+
+bool neighbourCell(int dir, int *nr, int *nc) {
+  *nr = curRow;
+  *nc = curCol;
+  if (dir == 0 && curRow > 0)               *nr = curRow - 1;
+  else if (dir == 1 && curCol < MAZE_SIZE-1)*nc = curCol + 1;
+  else if (dir == 2 && curRow < MAZE_SIZE-1)*nr = curRow + 1;
+  else if (dir == 3 && curCol > 0)          *nc = curCol - 1;
+  else return false;
+  return true;
+}
+
+bool physicalWallInDir(int dir) {
+  int rel = (dir - heading + 4) & 3;
+  if (rel == 0) return wallFront();
+  if (rel == 1) return wallRight();
+  if (rel == 3) return wallLeft();
+  return false;
+}
+
+int chooseNextDir() {
+  int bestDir = -1;
+  uint8_t bestVal = 255;
+
+  int order[4] = { heading, (heading+3)&3, (heading+1)&3, (heading+2)&3 };
+
+  for (int i = 0; i < 4; i++) {
+    int dir = order[i];
+    int nr, nc;
+    if (!neighbourCell(dir, &nr, &nc)) continue;
+
+    uint8_t w = walls[curRow][curCol];
+    int bit = (dir==0)?1:(dir==1)?2:(dir==2)?4:8;
+    if (w & bit) continue;
+    if (physicalWallInDir(dir)) continue;
+
+    if (distMap[nr][nc] < bestVal) {
+      bestVal = distMap[nr][nc];
+      bestDir = dir;
+    }
+  }
+  return bestDir;
+}
+
+void goToDir(int nextDir) {
+  int diff = (nextDir - heading + 4) & 3;
+  if (diff == 0) {
+    // straight
+  } else if (diff == 1) {
+    turnRight90();
+  } else if (diff == 3) {
+    turnLeft90();
+  } else if (diff == 2) {
+    turn180();
+  }
+  moveOneCell();
+}
+
+// ================= GOAL & SETUP/LOOP =================
+bool isGoal(int r, int c); // already defined above
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(M1_IN1, OUTPUT);
+  pinMode(M1_IN2, OUTPUT);
+  pinMode(M2_IN3, OUTPUT);
+  pinMode(M2_IN4, OUTPUT);
+
+  // PWM on ENA/ENB (ESP32 core 3.x)[web:7][web:11]
+  ledcAttachChannel(ENA, freq, resolution, chA);
+  ledcAttachChannel(ENB, freq, resolution, chB);
+  ledcWrite(ENA, 0);
+  ledcWrite(ENB, 0);
+
+  pinMode(IR_FRONT_PIN, INPUT);
+  pinMode(IR_LEFT_PIN,  INPUT);
+  pinMode(IR_RIGHT_PIN, INPUT);
+
+  initMaze();
+  initDistMap();
+  stopMotors();
+
+  // wait 3 seconds before starting
+  delay(3000);
+}
+
+void loop() {
+  if (isGoal(curRow, curCol)) {
+    stopMotors();
+    Serial.println("Goal reached");
+    while (1) { delay(1000); }
+  }
+
+  updateWallsHere();
+  recomputeFloodFill();
+
+  // ---------- DEAD-END CHECK: walls on three sides ----------
+  bool f = wallFront();
+  bool l = wallLeft();
+  bool r = wallRight();
+
+  // if there are walls on front, left, and right -> dead end, so reverse
+  if (f && l && r) {
+    turn180();      // rotate 180°
+    moveOneCell();  // go back one cell
+    return;         // skip normal flood-fill decision this cycle
+  }
+
+  // ---------- normal flood-fill movement ----------
+  int nextDir = chooseNextDir();
+  if (nextDir < 0) {
+    // no better neighbour -> also treat as dead end
+    turn180();
+    moveOneCell();
+  } else {
+    goToDir(nextDir);
+  }
+}
