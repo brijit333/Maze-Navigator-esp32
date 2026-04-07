@@ -1,5 +1,4 @@
  MAZE NAVIGATOR ESP32
- ....................
 
 DESCRIPTION
 ![WhatsApp Image 2026-04-07 at 21 54 38](https://github.com/user-attachments/assets/fd426187-f172-4a44-852e-868e5b481b0d)
